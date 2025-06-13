@@ -38,13 +38,14 @@ pub use gap_buffer::GapBuffer;
 
 use crate::arena::{ArenaString, scratch_arena};
 use crate::cell::SemiRefCell;
+use crate::clipboard::Clipboard;
 use crate::document::{ReadableDocument, WriteableDocument};
 use crate::framebuffer::{Framebuffer, IndexedColor};
 use crate::helpers::*;
 use crate::oklab::oklab_blend;
 use crate::simd::memchr2;
 use crate::unicode::{self, Cursor, MeasurementConfig};
-use crate::{apperr, icu};
+use crate::{apperr, icu, simd};
 
 /// The margin template is used for line numbers.
 /// The max. line number we should ever expect is probably 64-bit,
@@ -341,7 +342,7 @@ impl TextBuffer {
                     break 'outer;
                 }
 
-                let (delta, line) = unicode::newlines_forward(chunk, 0, 0, 1);
+                let (delta, line) = simd::lines_fwd(chunk, 0, 0, 1);
                 off += delta;
                 if line == 1 {
                     break;
@@ -427,7 +428,7 @@ impl TextBuffer {
             false
         } else {
             self.margin_enabled = enabled;
-            self.reflow(true);
+            self.reflow();
             true
         }
     }
@@ -482,7 +483,7 @@ impl TextBuffer {
             false
         } else {
             self.width = width;
-            self.reflow(true);
+            self.reflow();
             true
         }
     }
@@ -499,7 +500,7 @@ impl TextBuffer {
             false
         } else {
             self.tab_size = width;
-            self.reflow(true);
+            self.reflow();
             true
         }
     }
@@ -524,39 +525,54 @@ impl TextBuffer {
         self.ruler = column;
     }
 
-    fn reflow(&mut self, force: bool) {
-        // +1 onto logical_lines, because line numbers are 1-based.
-        // +1 onto log10, because we want the digit width and not the actual log10.
-        // +3 onto log10, because we append " | " to the line numbers to form the margin.
-        self.margin_width = if self.margin_enabled {
-            self.stats.logical_lines.ilog10() as CoordType + 4
-        } else {
-            0
-        };
+    pub fn reflow(&mut self) {
+        self.reflow_internal(true);
+    }
 
-        let text_width = self.text_width();
-        // 2 columns are required, because otherwise wide glyphs wouldn't ever fit.
-        let word_wrap_column =
-            if self.word_wrap_enabled && text_width >= 2 { text_width } else { 0 };
+    fn recalc_after_content_changed(&mut self) {
+        self.reflow_internal(false);
+    }
 
-        if force || self.word_wrap_column > word_wrap_column {
-            self.word_wrap_column = word_wrap_column;
+    fn reflow_internal(&mut self, force: bool) {
+        let word_wrap_column_before = self.word_wrap_column;
 
-            if self.cursor.offset != 0 {
-                self.cursor = self
-                    .cursor_move_to_logical_internal(Default::default(), self.cursor.logical_pos);
-            }
+        {
+            // +1 onto logical_lines, because line numbers are 1-based.
+            // +1 onto log10, because we want the digit width and not the actual log10.
+            // +3 onto log10, because we append " | " to the line numbers to form the margin.
+            self.margin_width = if self.margin_enabled {
+                self.stats.logical_lines.ilog10() as CoordType + 4
+            } else {
+                0
+            };
+
+            let text_width = self.text_width();
+            // 2 columns are required, because otherwise wide glyphs wouldn't ever fit.
+            self.word_wrap_column =
+                if self.word_wrap_enabled && text_width >= 2 { text_width } else { 0 };
+        }
+
+        self.cursor_for_rendering = None;
+
+        if force || self.word_wrap_column != word_wrap_column_before {
+            // Recalculate the cursor position.
+            self.cursor = self.cursor_move_to_logical_internal(
+                if self.word_wrap_column > 0 {
+                    Default::default()
+                } else {
+                    self.goto_line_start(self.cursor, self.cursor.logical_pos.y)
+                },
+                self.cursor.logical_pos,
+            );
 
             // Recalculate the line statistics.
-            if self.word_wrap_enabled {
+            if self.word_wrap_column > 0 {
                 let end = self.cursor_move_to_logical_internal(self.cursor, Point::MAX);
                 self.stats.visual_lines = end.visual_pos.y + 1;
             } else {
                 self.stats.visual_lines = self.stats.logical_lines;
             }
         }
-
-        self.cursor_for_rendering = None;
     }
 
     /// Replaces the entire buffer contents with the given `text`.
@@ -579,11 +595,9 @@ impl TextBuffer {
         self.redo_stack.clear();
         self.last_history_type = HistoryType::Other;
         self.cursor = Default::default();
-        self.cursor_for_rendering = None;
         self.set_selection(None);
-        self.search = None;
         self.mark_as_clean();
-        self.reflow(true);
+        self.reflow();
     }
 
     /// Copies the contents of the buffer into a string.
@@ -683,7 +697,7 @@ impl TextBuffer {
                     }
                 }
 
-                (offset, lines) = unicode::newlines_forward(chunk, offset, lines, lines + 1);
+                (offset, lines) = simd::lines_fwd(chunk, offset, lines, lines + 1);
 
                 // Check if the preceding line ended in CRLF.
                 if offset >= 2 && &chunk[offset - 2..offset] == b"\r\n" {
@@ -722,7 +736,7 @@ impl TextBuffer {
 
             // If the file has more than 1000 lines, figure out how many are remaining.
             if offset < chunk.len() {
-                (_, lines) = unicode::newlines_forward(chunk, offset, lines, CoordType::MAX);
+                (_, lines) = simd::lines_fwd(chunk, offset, lines, CoordType::MAX);
             }
 
             let final_newline = chunk.ends_with(b"\n");
@@ -1070,7 +1084,7 @@ impl TextBuffer {
         if let (Some(search), Some(..)) = (&mut self.search, &self.selection) {
             let search = search.get_mut();
             if search.selection_generation == self.selection_generation {
-                self.write(replacement.as_bytes(), true);
+                self.write(replacement.as_bytes(), self.cursor, true);
             }
         }
 
@@ -1093,7 +1107,7 @@ impl TextBuffer {
             if !self.has_selection() {
                 break;
             }
-            self.write(replacement, true);
+            self.write(replacement, self.cursor, true);
             offset = self.cursor.offset;
         }
 
@@ -1201,7 +1215,7 @@ impl TextBuffer {
         };
     }
 
-    fn measurement_config(&self) -> MeasurementConfig {
+    fn measurement_config(&self) -> MeasurementConfig<'_> {
         MeasurementConfig::new(&self.buffer)
             .with_word_wrap_column(self.word_wrap_column)
             .with_tab_size(self.tab_size)
@@ -1218,7 +1232,7 @@ impl TextBuffer {
                     break;
                 }
 
-                let (delta, line) = unicode::newlines_forward(chunk, 0, result.logical_pos.y, y);
+                let (delta, line) = simd::lines_fwd(chunk, 0, result.logical_pos.y, y);
                 result.offset += delta;
                 result.logical_pos.y = line;
             }
@@ -1238,8 +1252,7 @@ impl TextBuffer {
                     break;
                 }
 
-                let (delta, line) =
-                    unicode::newlines_backward(chunk, chunk.len(), result.logical_pos.y, y);
+                let (delta, line) = simd::lines_bwd(chunk, chunk.len(), result.logical_pos.y, y);
                 result.offset -= chunk.len() - delta;
                 result.logical_pos.y = line;
                 if delta > 0 {
@@ -1615,6 +1628,7 @@ impl TextBuffer {
 
                 let mut global_off = cursor_beg.offset;
                 let mut cursor_tab = cursor_beg;
+                let mut cursor_visualizer = cursor_beg;
 
                 while global_off < cursor_end.offset {
                     let chunk = self.read_forward(global_off);
@@ -1664,6 +1678,25 @@ impl TextBuffer {
                             };
                             // Our manually constructed UTF8 is never going to be invalid. Trust.
                             line.push_str(unsafe { str::from_utf8_unchecked(&visualizer_buf) });
+
+                            cursor_visualizer = self.cursor_move_to_offset_internal(
+                                cursor_visualizer,
+                                global_off + chunk_off - 1,
+                            );
+                            let visualizer_rect = {
+                                let left = destination.left
+                                    + self.margin_width
+                                    + cursor_visualizer.visual_pos.x
+                                    - origin.x;
+                                let top =
+                                    destination.top + cursor_visualizer.visual_pos.y - origin.y;
+                                Rect { left, top, right: left + 1, bottom: top + 1 }
+                            };
+
+                            let bg = fb.indexed(IndexedColor::Yellow);
+                            let fg = fb.contrasted(bg);
+                            fb.blend_bg(visualizer_rect, bg);
+                            fb.blend_fg(visualizer_rect, fg);
                         }
                     }
 
@@ -1790,22 +1823,76 @@ impl TextBuffer {
         Some(RenderResult { visual_pos_x_max })
     }
 
-    /// Inserts `text` at the current cursor position.
-    ///
-    /// If there's a current selection, it will be replaced.
-    /// The selection is cleared after the call.
-    pub fn write(&mut self, text: &[u8], raw: bool) {
-        if text.is_empty() {
+    pub fn cut(&mut self, clipboard: &mut Clipboard) {
+        self.cut_copy(clipboard, true);
+    }
+
+    pub fn copy(&mut self, clipboard: &mut Clipboard) {
+        self.cut_copy(clipboard, false);
+    }
+
+    fn cut_copy(&mut self, clipboard: &mut Clipboard, cut: bool) {
+        let line_copy = !self.has_selection();
+        let selection = self.extract_selection(cut);
+        clipboard.write(selection);
+        clipboard.write_was_line_copy(line_copy);
+    }
+
+    pub fn paste(&mut self, clipboard: &Clipboard) {
+        let data = clipboard.read();
+        if data.is_empty() {
             return;
         }
 
+        let pos = self.cursor_logical_pos();
+        let at = if clipboard.is_line_copy() {
+            self.goto_line_start(self.cursor, pos.y)
+        } else {
+            self.cursor
+        };
+
+        self.write(data, at, true);
+
+        if clipboard.is_line_copy() {
+            self.cursor_move_to_logical(Point { x: pos.x, y: pos.y + 1 });
+        }
+    }
+
+    /// Inserts the user input `text` at the current cursor position.
+    /// Replaces tabs with whitespace if needed, etc.
+    pub fn write_canon(&mut self, text: &[u8]) {
+        self.write(text, self.cursor, false);
+    }
+
+    /// Inserts `text` as-is at the current cursor position.
+    /// The only transformation applied is that newlines are normalized.
+    pub fn write_raw(&mut self, text: &[u8]) {
+        self.write(text, self.cursor, true);
+    }
+
+    fn write(&mut self, text: &[u8], at: Cursor, raw: bool) {
+        let history_type = if raw { HistoryType::Other } else { HistoryType::Write };
+
+        // If we have an active selection, writing an empty `text`
+        // will still delete the selection. As such, we check this first.
         if let Some((beg, end)) = self.selection_range_internal(false) {
-            self.edit_begin(HistoryType::Write, beg);
+            self.edit_begin(history_type, beg);
             self.edit_delete(end);
             self.set_selection(None);
         }
+
+        // If the text is empty the remaining code won't do anything,
+        // allowing us to exit early.
+        if text.is_empty() {
+            // ...we still need to end any active edit session though.
+            if self.active_edit_depth > 0 {
+                self.edit_end();
+            }
+            return;
+        }
+
         if self.active_edit_depth <= 0 {
-            self.edit_begin(HistoryType::Write, self.cursor);
+            self.edit_begin(history_type, at);
         }
 
         let mut offset = 0;
@@ -2061,7 +2148,7 @@ impl TextBuffer {
                 selection_end.x -= remove as CoordType;
             }
 
-            (offset, y) = unicode::newlines_forward(&replacement, offset, y, y + 1);
+            (offset, y) = simd::lines_fwd(&replacement, offset, y, y + 1);
         }
 
         if replacement.len() == initial_len {
@@ -2084,7 +2171,8 @@ impl TextBuffer {
 
     /// Extracts the contents of the current selection.
     /// May optionally delete it, if requested. This is meant to be used for Ctrl+X.
-    pub fn extract_selection(&mut self, delete: bool) -> Vec<u8> {
+    fn extract_selection(&mut self, delete: bool) -> Vec<u8> {
+        let line_copy = !self.has_selection();
         let Some((beg, end)) = self.selection_range_internal(true) else {
             return Vec::new();
         };
@@ -2097,6 +2185,11 @@ impl TextBuffer {
             self.edit_delete(end);
             self.edit_end();
             self.set_selection(None);
+        }
+
+        // Line copies (= Ctrl+C when there's no selection) always end with a newline.
+        if line_copy && !out.ends_with(b"\n") {
+            out.replace_range(out.len().., if self.newlines_are_crlf { b"\r\n" } else { b"\n" });
         }
 
         out
@@ -2291,10 +2384,7 @@ impl TextBuffer {
             self.stats.visual_lines = self.stats.logical_lines;
         }
 
-        self.search = None;
-
-        // Also takes care of clearing `cursor_for_rendering`.
-        self.reflow(false);
+        self.recalc_after_content_changed();
     }
 
     /// Undo the last edit operation.
@@ -2357,7 +2447,7 @@ impl TextBuffer {
                 let mut offset = cursor.offset;
 
                 while beg < added.len() {
-                    let (end, line) = unicode::newlines_forward(added, beg, 0, 1);
+                    let (end, line) = simd::lines_fwd(added, beg, 0, 1);
                     let has_newline = line != 0;
                     let link = &added[beg..end];
                     let line = unicode::strip_newline(link);
@@ -2408,8 +2498,7 @@ impl TextBuffer {
             }
         }
 
-        // Also takes care of clearing `cursor_for_rendering`.
-        self.reflow(false);
+        self.recalc_after_content_changed();
     }
 
     /// For interfacing with ICU.
